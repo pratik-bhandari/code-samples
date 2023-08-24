@@ -1,0 +1,1008 @@
+---
+title: "Bayesian Logistic Regression"
+author: "Pratik Bhandari"
+date: "2021-10-15 (last edited: `r format(Sys.time())`)"
+output:
+  html_document:
+    toc: yes
+    toc_depth: 3
+    number_sections: yes
+    toc_float:
+      collapsed: no
+      smooth_scroll: yes
+---
+
+```{r setup, include=TRUE, cache=TRUE, eval=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE)  #by default, all the code chunks below will be displayed when this markdown file is rendered.
+
+options(mc.cores = parallel::detectCores()) # parallel computation
+
+# Load some packages
+library(tidyverse)
+# library(rstan)
+library(brms)
+library(bayesplot)
+library(patchwork)
+library(extraDistr)
+# library(hypr)
+# library(tictoc)
+library(lme4)
+```
+
+```{r dat_import, cache=FALSE, eval=FALSE, echo=TRUE}
+# Load data
+load(here::here('bayes2.RData')) #Loads the data, priors, models that are already run in my computer.
+```
+
+
+```{r functions, include=FALSE, cache=TRUE}
+# Defining some functions
+# 
+prob2logit <- function(p){log(p/(1-p))} #Converts probability to logit
+
+logit2prob <- function(x){ exp(x)/(1+exp(x)) } #Converts logit to probability
+
+makeplot <- function(a=0, b=1.5, n=1e6){
+  sample_prob <- tibble(p = plogis(rnorm(n=n, mean=a, sd=b)))
+  ggplot(sample_prob, aes(p)) + geom_density() + ggtitle(paste('N', '(', a, ',', b, ')'))
+}
+
+```
+
+```{r change-names, echo=TRUE, eval=FALSE, cache=TRUE}
+# First, set levels
+
+# dat.satz <- dat.satz %>% rename(channels = noiseband, predictability = cloze)
+
+dat.satz2 <- dat.satz
+
+dat.satz2$channels <- factor(dat.satz2$channels,
+                             levels = c('4', '6', '8'),
+                             labels = c('4', '6', '8'))
+dat.satz2$predictability <- factor(dat.satz2$predictability,
+                             levels = c('Low', 'Mid', 'High'),
+                             labels = c('Low', 'Mid', 'High'))
+```
+
+# Experiment and Data
+
+48 participants listened to noise vocoded speech passed through 4, 6 and 8 channels noise-vocoding. Sentences with high, medium and low predictability target words were presented in each trial. A total of 90 trials are presented. Participants transcribed the entire sentence.
+
+-   Dependent variable: binary responses (correct/incorrect nouns)
+
+-   Predictors:
+
+    -   Target word predictability: 3 levels -- High, Medium, Low predictability
+    -   Speech degradation: 3 levels -- 4, 6, 8 channels noise-vocoding
+    
+```{r overall-accuracy, echo=TRUE, eval=FALSE, cache=TRUE}
+dat.satz %>% ggplot(aes(noun_corr)) + geom_bar() +
+  facet_grid(channels~predictability) +
+  xlab('Accuracy') + ggtitle('Overview of the data')
+```
+
+```{r accuracy-per-channel, echo=TRUE, eval=FALSE, cache=TRUE}
+dat.satz %>% group_by(channels) %>% ggplot(aes(noun_corr)) + geom_bar() +
+  facet_grid(~channels) +
+  xlab('Accuracy') + ggtitle('Accuracy per channel condition')
+```
+
+```{r accuracy-per-cloze, echo=TRUE, eval=FALSE, cache=TRUE}
+dat.satz %>% group_by(predictability) %>% ggplot(aes(noun_corr)) + geom_bar() +
+  facet_grid(~predictability) +
+  xlab('Accuracy') + ggtitle('Accuracy per predictability level')
+```
+
+> Accuracy increases with an increase in number of noise vocoded channels.
+
+# Setting contrasts
+
+Contrasts are set to *treatment contrasts*.\
+One main reason is to have a reasonably interpretable intercept. In most other contrasts, the intercept is the grand mean, and assigning prior to the grand mean is a bit tricky.\
+Another reason --- I found it difficult to navigate across the spaces of logit scale and probability scale with other contrasts. It is relatively easier with the treatment contrast, but there are still some gaps, I think.
+
+
+```{r contrasts, eval=FALSE, echo=TRUE, cache=TRUE}
+dat.satz2$channels <- factor(dat.satz2$channels,
+                             levels = c('4', '6', '8'),
+                             labels = c('4', '6', '8'))
+dat.satz2$predictability <- factor(dat.satz2$predictability,
+                             levels = c('Low', 'Mid', 'High'),
+                             labels = c('Low', 'Mid', 'High'))
+
+contrasts(dat.satz2$channels) <- contr.treatment(3, base = 3)
+contrasts(dat.satz2$predictability) <- contr.treatment(3, base = 3)
+# hypr::hypr(contrasts(dat.satz2$predictability))
+```
+
+-   For predictability: base level = High predictability; treatment levels = Low, and Medium
+-   For channels: base level = 8ch; treatment levels = 4ch, and 6ch
+-   The intercept is High Predictability, 8 channels
+
+# Regularizing priors
+
+```{r regpriors, echo=TRUE, eval=FALSE, cache=TRUE}
+regularizing_priors_trt <- c( 
+                          prior(normal(1.5, 1), class = Intercept), # alpha; base level = 8ch, HP
+                          prior(normal(0, 1), class = b), # all the betas
+                          prior(normal(0, 1), class = sd) # hyperparameters
+                          ) 
+    
+```
+
+$N(1.5, 1)$ restricts the accuracy to around 80% --> 8ch, HP.\
+$N(0, 1)$ restricts the two extremes of the probability space.
+
+```{r plot_prob, echo=TRUE, eval=FALSE, cache=TRUE}
+
+makeplot(0, 1)
+
+```
+
+
+## Prior predictive check
+
+This generates a dataset of binomial distribution with $70\%$ probability of correct response.\
+
+```{r simdata, echo=TRUE, eval=FALSE, cache=TRUE}
+set.seed(1973)
+sim_corr2 <- extraDistr::rbern(nrow(dat.satz2), prob = 0.7)
+dat.satz2$sim_corr <- sim_corr2
+```
+
+The value of `prob` doesn't matter much because `brm()` works only on priors.\
+(see the argument `sample_prior = 'only'` below)
+
+
+```{r priorpred_reg, echo=TRUE, eval=FALSE, cache=TRUE, results='hide'}
+prior_check_model_regularizing_trt = brm(sim_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability + channels + predictability:channels || participants) +
+                        (1 + predictability + channels + predictability:channels || itemNo),
+                prior = regularizing_priors_trt,
+                sample_prior = 'only',
+                data = dat.satz2,
+                family = "bernoulli",
+                cores = 4,
+                chains = 4,
+                warmup = 2000,
+                iter = 4000)
+```
+
+Now the plots.
+
+```{r priorpredcheck_noise_reg, echo=TRUE, eval=FALSE, cache=FALSE}
+bayesplot::pp_check(prior_check_model_regularizing_trt,
+         type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Channels)',
+    subtitle = 'With regularizing priors')
+```
+
+> Although the average number of correct responses is higher than the average number of incorrect responses across all conditions, their ranges overlap. This suggests that there can be instances, given these regularizing priors, when the number of correct and incorrect responses are equal, or the number of incorrect response is higher than the number of correct responses at 8-channels, or at HP.
+
+```{r priorpredcheck_cloze_reg, echo=FALSE, eval=FALSE, cache=TRUE}
+bayesplot::pp_check(prior_check_model_regularizing_trt,
+         type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Predictability)',
+    subtitle = 'With regularizing priors')
+```
+
+Assuming these priors are **not** outright unfit for the data, we continue with model fitting.
+
+## Model fitting
+
+```{r model_reg, echo=TRUE, eval=FALSE, cache=TRUE, results='hide'}
+model_reg_prior_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = regularizing_priors_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000)
+```
+
+## Model diagnostics
+
+Trace plots.\
+
+```{r traceplot_reg, eval=FALSE, echo=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+mcmc_plot(model_reg_prior_trt, type="trace",
+          pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2')) +
+  ggplot2::labs(title = 'With regularizing priors') 
+```
+
+The hairy-caterpillar plots look satisfactory with no divergence.
+
+## Model summary
+
+```{r fixef_reg, echo=TRUE, eval=FALSE, cache=TRUE}
+kableExtra::kbl(fixef(model_reg_prior_trt)) %>% kableExtra::kable_paper()
+```
+
+> The direction of the estimates (main effects) seem to align with the expectation at first glance --- it is negative. Zero lies in some credible intervals. But their interpretation in logit scale is not the same as in, say, millisecond scale, I suppose.
+
+## Posterior predictive check
+
+```{r ppcheck_logodds_reg, echo=TRUE, eval=FALSE, cache=TRUE}
+bayesplot::mcmc_areas(as.matrix(model_reg_prior_trt),
+           pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2'),
+             prob = 0.95) +
+  ggplot2::labs(
+    title = 'Parameter distribution',
+    subtitle = 'With regularizing priors')
+```
+
+This plot is the same as the model summary above; it shows the posterior distribution of model parameters (slopes and intercepts).
+
+```{r ppcheck_noise_reg, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_reg_prior_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Channels)',
+    subtitle = 'With regularizing priors')
+```
+
+Posterior predictive check shows that the model predictions ($y_{rep}$) fall within the data (light blue bars) with a small range of uncertainty.
+
+```{r ppcheck_cloze_reg, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_reg_prior_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) + ggtitle('With regularizing priors') +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Predictability)',
+    subtitle = 'With regularizing priors')
+```
+
+
+------------------------------------------------------------------------
+
+# Informative priors 2
+
+```{r infoprior2, echo=TRUE, eval=FALSE, cache=TRUE}
+informative_priors2_trt <- c( 
+                          prior(normal(1.5, 0.5), class = Intercept), #alpha
+                          prior(normal(1, 0.5), class = b), #all the betas
+                          prior(normal(0, 0.5), class = sd) # hyperparameter
+                          )
+```
+
+Regularizing priors were:\
+
+```{r repeat_reg_priors, echo=TRUE, eval=FALSE, cache=TRUE}
+ # Regularizing priors:
+ 
+            prior(normal(1.5, 1), class = Intercept),
+            prior(normal(0, 1), class = b), 
+            prior(normal(0, 1), class = sd)
+```
+
+The variances of all parameters are reduced.
+The mean accuracy of the betas are restricted towards higher values.
+
+## Prior predictive check
+
+```{r priorpred_info2, echo=TRUE, eval=FALSE, cache=TRUE, results='hide'}
+prior_check_model_informative2_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability + channels + predictability:channels || participants) +
+                        (1 + predictability + channels + predictability:channels || itemNo),
+                prior = informative_priors2_trt,
+                sample_prior = 'only',
+                data = dat.satz2,
+                family = "bernoulli",
+                cores = 4,
+                chains = 4,
+                warmup = 2000,
+                iter = 4000)
+```
+
+```{r priorpredcheck_noise_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative2_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Channels)',
+    subtitle = 'With informative priors 2')
+```
+
+
+```{r priorpredcheck_cloze_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative2_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Predictability)',
+    subtitle = 'With informative priors 2')
+```
+
+> The average number of correct responses is higher than the average number of incorrect responses across all conditions, but their ranges overlap at 4-channels, and at LP. That is, at some instances, with these priors, the number of incorrect responses can be higher than or equal to the number of correct responses at 4-channels, and at LP.
+
+## Model fitting
+
+```{r model_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+model_info_prior2_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors2_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000)
+```
+
+## Model diagnostics
+
+Trace plots.\
+
+```{r traceplot_info2, eval=FALSE, echo=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+mcmc_plot(model_info_prior2_trt, type="trace",
+          pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2')) +
+  ggplot2::labs(title = 'With informative priors 2')
+```
+
+No divergence in the hairy-caterpillar plots.
+
+## Model summary
+
+```{r fixef_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+kableExtra::kbl(lme4::fixef(model_info_prior2_trt)) %>% kableExtra::kable_paper()
+# DT::datatable(fixef(model_info_prior2_trt))
+```
+
+> The direction of `channels2` is positive.\
+Credible intervals of some other estimates range from -ve to +ve values.
+
+
+## Posterior predictive check
+
+```{r ppcheck_logodds_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+bayesplot::mcmc_areas(as.matrix(model_info_prior2_trt),
+           pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2'),
+             prob = 0.95)
+```
+
+```{r ppcheck_noise_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior2_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Channels)',
+    subtitle = 'With informative priors 2')
+```
+
+> Posterior predictive check shows that the model predictions ($y_{rep}$) fall within the data (light blue bars).\
+However, it seems like these plots are not displaying what I think they are displaying. This and the preceding model-predictions fit the data with almost no uncertainty. Same with model-predictions that follow.
+
+```{r ppcheck_cloze_info2, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior2_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Predictability)',
+    subtitle = 'With informative priors 2')
+```
+
+------------------------------------------------------------------------
+
+# Informative priors 3
+
+The priors for the all the main effects are specified separately.\
+Not all interaction terms are specified; fairly agnostic about them.\
+(Later realized that some priors for main effects do not match with the data, as I already know what the data looks like --> for example, accuracy for `predictability1` shouldn't have been so low.)
+
+```{r infoprior3, echo=TRUE, eval=FALSE, cache=TRUE}
+informative_priors3_trt <- c(
+  prior(normal(2, 0.5), class = Intercept), #alpha; ~90% [88%];
+  
+  prior(normal(-3.5, 0.5), class = b, coef = predictability1), #beta1 LP ~ 20% ~ 18.24
+  prior(normal(-1.15, 0.5), class = b, coef = predictability2), #beta1; MP = 70% ~70.06; prob2logit(.7) - 2; sd is sd of the diff. betwn HP and MP
+  
+  prior(normal(-4.2, 0.5), class = b, coef = channels1), #beta2; 4ch = 10% ~ 9.98
+  prior(normal(-0.6, 0.5), class = b, coef = channels2), #beta2; 6ch = 80% ~80.22
+  
+  prior(normal(0, 1), class = b, coef = predictability1:channels1), #beta3
+  prior(normal(0, 1), class = b, coef = predictability1:channels2), #beta3
+  prior(normal(0, 1), class = b, coef = predictability2:channels1), #beta3
+  prior(normal(0, 1), class = b, coef = predictability2:channels2), #beta3
+  
+  prior(normal(0, 1), class = sd, group = participants), #u_beta1,2, 3
+  prior(normal(0, 1), class = sd, group = itemNo) #w_beta1, 2, 3
+)
+```
+
+To get the point value --> Accuracy = alpha + beta;\
+To get beta --> beta = Accuracy - alpha;\
+i.e., beta = (Accuracy in logit scale) - alpha\
+
+<!-- The priors for the main effects are outright wrong, I think.\ -->
+<!-- For example, `predictability1` is the difference between `predictability1` and `predictability0` at `channels0` (baseline). This translates to: `predictability1` is the difference in accuracy between LP and HP at 8-channels which instead of $20%$ is approx. negative $5%$.  -->
+
+<!-- Non-extreme values (i.e., 95% of AUC in a normal distribution) fall in the range of plus/minus 1.96*sd (approx. 2*sd) -->
+
+<!-- logit2prob(alpha + actual_beta) = accuracy-->
+
+## Prior predictive check
+
+```{r priorpred_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+prior_check_model_informative3_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability + channels + predictability:channels || participants) +
+                        (1 + predictability + channels + predictability:channels || itemNo),
+                prior = informative_priors3_trt,
+                sample_prior = 'only',
+                data = dat.satz2,
+                family = "bernoulli",
+                cores = 4,
+                chains = 4,
+                warmup = 2000,
+                iter = 4000)
+```
+
+```{r priorpredcheck_noise_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative3_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Channels)',
+    subtitle = 'With informative priors 3')
+```
+
+```{r priorpredcheck_cloze_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative3_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Predictability)',
+    subtitle = 'With informative priors 3')
+```
+
+This is similar to *Informative priors 2* in that the ranges overlap for 4-channels and LP.
+
+## Model fitting
+
+```{r model_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+model_info_prior3_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors3_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000)
+```
+
+## Model diagnostics
+
+Trace plots.\
+
+```{r traceplot_info3, eval=FALSE, echo=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+mcmc_plot(model_info_prior3_trt, type="trace",
+          pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2')) +
+  ggplot2::labs(title = 'With informative priors 3')
+```
+
+No divergences in the hairy-caterpillar plots.
+
+## Model summary
+
+```{r fixef_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+kableExtra::kbl(lme4::fixef(model_info_prior3_trt)) %>% kableExtra::kable_paper()
+```
+
+The estimates and the credible intervals for the main effects are negative.\
+
+## Posterior predictive check
+
+```{r ppcheck_logodds_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+bayesplot::mcmc_areas(as.matrix(model_info_prior3_trt),
+           pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2'),
+             prob = 0.95)
+
+```
+
+```{r ppcheck_noise_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior3_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Channels)',
+    subtitle = 'With informative priors 3')
+```
+
+Posterior predictive check shows that the model predictions ($y_{rep}$) fall within the data (light blue bars) with small range of uncertainty.
+
+```{r ppcheck_cloze_info3, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior3_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Predictability)',
+    subtitle = 'With informative priors 3')
+```
+
+-----------------------------------------------------------------------------
+
+<!--
+# Informative priors 4
+
+These are similar to *Informative priors 3*; the difference is in the priors for interaction terms.\
+Priors for the interaction terms are more informative.
+
+```{r infoprior4, echo=TRUE, eval=FALSE, cache=TRUE}
+informative_priors4_trt <- c(
+  prior(normal(2, 0.5), class = Intercept), #alpha; ~90% [88%]; SD=1 is heavily skewed, so sd=.5
+  
+  prior(normal(-3.5, 0.5), class = b, coef = predictability1), #beta1 LP ~ 20% ~ 18.24
+  prior(normal(-1.15, 0.5), class = b, coef = predictability2), #beta1; MP = 70% ~70.06; prob2logit(.7) - 2; sd is sd of the diff. betwn HP and MP; can use sd=.5 too
+  
+  prior(normal(-4.2, 0.5), class = b, coef = channels1), #beta2; 4ch = 10% ~ 9.98
+  prior(normal(-0.6, 0.5), class = b, coef = channels2), #beta2; 6ch = 80% ~80.22
+  
+  prior(normal(-2.9, 1), class = b, coef = predictability1:channels1), #beta3; LP-HP diff 4ch vs 8ch => 5%
+  prior(normal(-4.6, 1), class = b, coef = predictability1:channels2), #beta3; LP-HP diff 6ch vs 8ch => 1% 
+  prior(normal(-1.4, 1), class = b, coef = predictability2:channels1), #beta3; MP-HP diff 4ch vs 8ch => 2%
+  prior(normal(-4.6, 1), class = b, coef = predictability2:channels2), #beta3; MP-HP diff 6ch vs 8ch => 1%
+  
+  prior(normal(0, 1), class = sd, group = participants), #u_beta1,2, 3
+  prior(normal(0, 1), class = sd, group = itemNo) #w_beta1, 2, 3
+)
+```
+
+logit2prob(alpha + actual_beta) = accuracy-->
+
+<!--
+## Prior predictive check
+
+```{r priorpred_info4, eval=FALSE, echo=TRUE, cache=TRUE}
+prior_check_model_informative4_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability + channels + predictability:channels || participants) +
+                        (1 + predictability + channels + predictability:channels || itemNo),
+                prior = informative_priors4_trt,
+                sample_prior = 'only',
+                data = dat.satz2,
+                family = "bernoulli",
+                cores = 4,
+                chains = 4,
+                warmup = 2000,
+                iter = 4000)
+```
+
+
+```{r priorpredcheck_noise_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative4_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Channels)',
+    subtitle = 'With informative priors 4')
+```
+
+
+```{r priorpredcheck_cloze_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative4_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Predictability)',
+    subtitle = 'With informative priors 4')
+```
+
+
+## Model fitting
+
+```{r model_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+model_info_prior4_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors4_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000)
+```
+
+## Model diagnostics
+
+Trace plots.\
+The hairy-caterpillar plots look satisfactory -- no divergences.
+
+```{r traceplot_info4, eval=FALSE, echo=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+mcmc_plot(model_info_prior4_trt, type="trace",
+          pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2')) +
+  ggplot2::labs(title = 'With informative priors 4')
+```
+
+## Model summary
+
+```{r fixef_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+kableExtra::kbl(lme4::fixef(model_info_prior4_trt)) %>% kableExtra::kable_paper()
+```
+
+> This model and the preceding model with *Informative priors 3* differ mainly in their posteriors of the interaction terms; their prior specifications are quite different.
+
+## Posterior predictive check
+
+```{r ppcheck_logodds_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+bayesplot::mcmc_areas(as.matrix(model_info_prior4_trt),
+           pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2'),
+             prob = 0.95)
+
+```
+
+```{r ppcheck_noise_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior4_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Channels)',
+    subtitle = 'With informative priors 4')
+```
+
+Posterior predictive check shows that the model predictions ($y_{rep}$) fall within the data (light blue bars) with small range of uncertainty.
+
+```{r ppcheck_cloze_info4, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior4_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Predictability)',
+    subtitle = 'With informative priors 4')
+```
+
+-->
+
+# Informative priors 5
+
+```{r infoprior5, echo=TRUE, eval=FALSE, cache=TRUE}
+informative_priors5_trt <- c(
+  prior(normal(4, 0.5), class = Intercept), #alpha; HP at 8ch; ~98%
+  
+  prior(normal(-2.9, 0.5), class = b, coef = predictability1), #beta1 LP-HP at 8ch = 5%
+  prior(normal(-3.5, 0.5), class = b, coef = predictability2), #beta1; MP-HP at 8ch = 3%
+  
+  prior(normal(-1.1, 0.5), class = b, coef = channels1), #beta2; 4ch-8ch at HP = 25% 
+  prior(normal(-2.9, 0.5), class = b, coef = channels2), #beta2; 6ch-8ch at HP = 5%
+  
+  prior(normal(-2.9, 1), class = b, coef = predictability1:channels1), #beta3; LP-HP diff 4ch vs 8ch => 5%
+  prior(normal(-4.6, 1), class = b, coef = predictability1:channels2), #beta3; LP-HP diff 6ch vs 8ch => 1% 
+  prior(normal(-3.9, 1), class = b, coef = predictability2:channels1), #beta3; MP-HP diff 4ch vs 8ch => 2%
+  prior(normal(-4.6, 1), class = b, coef = predictability2:channels2), #beta3; MP-HP diff 6ch vs 8ch => 1%
+  
+  prior(normal(0, 1), class = sd, group = participants), #u_beta1,2, 3
+  prior(normal(0, 1), class = sd, group = itemNo) #w_beta1, 2, 3
+)
+```
+
+
+## Prior predictive check
+
+```{r priorpred_info5, eval=FALSE, echo=TRUE, cache=TRUE}
+prior_check_model_informative5_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability + channels + predictability:channels || participants) +
+                        (1 + predictability + channels + predictability:channels || itemNo),
+                prior = informative_priors5_trt,
+                sample_prior = 'only',
+                data = dat.satz2,
+                family = "bernoulli",
+                cores = 4,
+                chains = 4,
+                warmup = 2000,
+                iter = 4000)
+```
+
+
+```{r priorpredcheck_noise_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative5_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Channels)',
+    subtitle = 'With informative priors 5')
+```
+
+
+```{r priorpredcheck_cloze_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(prior_check_model_informative5_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Prior predictive check (Predictability)',
+    subtitle = 'With informative priors 5')
+```
+
+There are some overlaps at 6-channels and at MP.
+
+## Model fitting
+
+```{r model_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+model_info_prior5_trt <- brm(noun_corr ~ predictability + channels + predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors5_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000)
+```
+
+## Model diagnostics
+
+Trace plots.\
+The hairy-caterpillar plots look satisfactory -- no divergences.
+
+```{r traceplot_info5, eval=FALSE, echo=TRUE, cache=TRUE, message=FALSE, warning=FALSE}
+mcmc_plot(model_info_prior5_trt, type="trace",
+          pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2')) +
+  ggplot2::labs(title = 'With informative priors 5')
+```
+
+## Model summary
+
+```{r fixef_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+kableExtra::kbl(lme4::fixef(model_info_prior5_trt)) %>% kableExtra::kable_paper()
+```
+
+> All the main effects are in the negative (including their credible intervals). The credible intervals of the interaction terms are negative too (see the plot below). These priors are, at least, correct specifications.
+
+## Posterior predictive check
+
+```{r ppcheck_logodds_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+bayesplot::mcmc_areas(as.matrix(model_info_prior5_trt),
+           pars = c(
+             'b_Intercept',
+             'b_predictability1',
+             'b_predictability2',
+             'b_channels1',
+             'b_channels2',
+             'b_predictability1:channels1',
+             'b_predictability1:channels2',
+             'b_predictability2:channels1',
+             'b_predictability2:channels2'),
+             prob = 0.95)
+
+```
+
+```{r ppcheck_noise_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior5_trt, type = "bars_grouped", group= c("channels"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Channels)',
+    subtitle = 'With informative priors 5')
+```
+
+Posterior predictive check shows that the model predictions ($y_{rep}$) fall within the data (light blue bars) with small range of uncertainty.
+
+```{r ppcheck_cloze_info5, echo=TRUE, eval=FALSE, cache=TRUE}
+pp_check(model_info_prior5_trt, type = "bars_grouped", group= c("predictability"),
+         ndraws = 250) +
+  ggplot2::labs(
+    title = 'Posterior predictive check (Predictability)',
+    subtitle = 'With informative priors 5')
+```
+
+
+------------------------------------------------------------------------
+
+# Quantifying evidence with Bayes Factor
+
+First create null models corresponding to full models created above. These null models are void of the *predictability:channels* interaction term in the fixed effects.
+
+## Null models
+
+```{r model_reg_NULL, echo=TRUE, eval=FALSE, cache=TRUE}
+model_reg_prior_NULL <- brm(noun_corr ~ predictability + channels + #predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = regularizing_priors_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000,
+                      # control = list(adapt_delta = 0.99),
+                      save_pars = save_pars(all = TRUE),
+                      file = "full-model_reg_4000")
+
+```
+
+```{r infoprior1_comp, echo=TRUE, eval=FALSE, cache=TRUE}
+informative_priors1_trt_comp <- c(
+  prior(normal(2, .5), class = Intercept), #alpha; ~90% [88%]; SD=1 is heavily skewed, so sd=.5
+  
+  prior(normal(-3.5, 0.5), class = b, coef = predictability1), #beta1 LP ~ 20% ~ 18.24
+  prior(normal(-1.15, 0.1), class = b, coef = predictability2), #beta1; MP = 70% ~70.06; prob2logit(.7) - 2; sd is sd of the diff. betwn HP and MP; can use sd=.5 too
+  
+  prior(normal(-4.2, 0.5), class = b, coef = channels1), #beta2; 4ch = 10% ~ 9.98
+  prior(normal(-.60, .1), class = b, coef = channels2), #beta2; 6ch = 80% ~80.22
+  
+  # prior(normal(-4.95, 1), class = b, coef = predictability1:channels1), #beta3; 4chLP= 5% ~ 4.97
+  # prior(normal(0.2, 1), class = b, coef = predictability1:channels2), #beta3; 6chLP = 90% ~ 90.02
+  # prior(normal(-4.2, 1), class = b, coef = predictability2:channels1), #beta3; 4chMP = 10% ~ 9.98
+  # prior(normal(1, 1), class = b, coef = predictability2:channels2), #beta3; 6chMP = 95%% ~ 95.26
+  
+  prior(normal(0, 1), class = sd, group = participants), #u_beta1,2, 3
+  prior(normal(0, 1), class = sd, group = itemNo) #w_beta1, 2, 3
+)
+```
+
+Priors for the interaction terms have to be removed because there are no interaction terms in the NULL model. Keeping them throws an error that those priors are not specified.
+
+```{r model_info1_NULL, echo=TRUE, eval=FALSE, cache=TRUE}
+model_info_prior1_NULL <- brm(noun_corr ~ predictability + channels + #predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors1_trt_comp,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000,
+                      # control = list(adapt_delta = 0.99),
+                      save_pars = save_pars(all = TRUE),
+                      file = "full-model_info1_4000")
+
+```
+
+```{r model_info2_NULL, echo=TRUE, eval=FALSE, cache=TRUE}
+
+model_info_prior2_NULL <- brm(noun_corr ~ predictability + channels + #predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors2_trt,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000,
+                      # control = list(adapt_delta = 0.99),
+                      save_pars = save_pars(all = TRUE))
+
+```
+
+```{r infoprior3_comp, echo=TRUE, eval=FALSE, cache=TRUE}
+informative_priors3_trt_comp <- c(
+  prior(normal(2, 0.5), class = Intercept), #alpha; ~98; SD=1 is heavily skewed, so sd=.5
+  
+  prior(normal(-3.5, 0.5), class = b, coef = predictability1), #beta1 LP ~ 20% ~ 18.24
+  prior(normal(-1.15, 0.5), class = b, coef = predictability2), #beta1; MP = 70% ~70.06; prob2logit(.7) - 2; sd is sd of the diff. betwn HP and MP; can use sd=.5 too
+  
+  prior(normal(-4.2, 0.5), class = b, coef = channels1), #beta2; 4ch = 10% ~ 9.98
+  prior(normal(-0.6, 0.5), class = b, coef = channels2), #beta2; 6ch = 80% ~80.22
+  
+  # prior(normal(0, 1), class = b, coef = predictability1:channels1), #beta3
+  # prior(normal(0, 1), class = b, coef = predictability1:channels2), #beta3
+  # prior(normal(0, 1), class = b, coef = predictability2:channels1), #beta3
+  # prior(normal(0, 1), class = b, coef = predictability2:channels2), #beta3
+  
+  prior(normal(0, 1), class = sd, group = participants), #u_beta1,2, 3
+  prior(normal(0, 1), class = sd, group = itemNo) #w_beta1, 2, 3
+)
+```
+
+```{r model_info3_NULL, echo=TRUE, eval=FALSE, cache=TRUE}
+model_info_prior3_NULL <- brm(noun_corr ~ predictability + channels +# predictability:channels +
+                        (1 + predictability*channels || participants) +
+                        (1 + predictability*channels || itemNo),
+                      prior = informative_priors3_trt_comp,
+                      data = dat.satz2,
+                      family = "bernoulli",
+                      cores = 4,
+                      chains = 4,
+                      warmup = 2000,
+                      iter = 4000,
+                      # control = list(adapt_delta = 0.99),
+                      save_pars = save_pars(all = TRUE))
+
+```
+
+
+## Bridge sampling
+
+```{r bridge_sampling, echo=TRUE, eval=FALSE, cache=TRUE}
+logLik_model_reg_prior <- bridge_sampler(model_reg_prior_trt, silent = TRUE)
+logLik_model_info_prior1 <- bridge_sampler(model_info_prior1_trt, silent = TRUE)
+logLik_model_info_prior2 <- bridge_sampler(model_info_prior2_trt, silent = TRUE)
+logLik_model_info_prior3 <- bridge_sampler(model_info_prior3_trt, silent = TRUE)
+# 
+logLik_model_reg_prior_NULL <- bridge_sampler(model_reg_prior_NULL, silent = TRUE)
+logLik_model_info_prior1_NULL <- bridge_sampler(model_info_prior1_NULL, silent = TRUE)
+logLik_model_info_prior2_NULL <- bridge_sampler(model_info_prior2_NULL, silent = TRUE)
+logLik_model_info_prior3_NULL <- bridge_sampler(model_info_prior3_NULL, silent = TRUE)
+
+```
+
+**R aborts here!**
+
+![R session aborts when-wher-ever I try bridge sampling.](r-aborts.png){#id .class width="55%" height="55%"}
+
+This is a problem posted in `brms` discourse. People respond that it is due to problem with `rstan` and leave it to `rstan` people. On the rstan discourse, it is not solved either.\
+One of the proposed solutions is to run the model entirely in stan, which I have yet to try\
+
+------------------------------------------------------------------------
+
+Summary statement: This is an **incomplete** analysis pipeline. No discovery claims are made from these analyses.
+
+------------------------------------------------------------------------
+
+<!--At this point, Bayesian analyses was not be my primary statistical analyses framework.\-->

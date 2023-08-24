@@ -1,0 +1,196 @@
+---
+title: "DSST preprocessing"
+author: "Pratik Bhandari"
+date: "2019-07-19 (last edited: `r format(Sys.time())`)"
+editor_options: 
+  chunk_output_type: inline
+output: 
+    html_document:
+        toc: yes
+        toc_depth: 3
+        number_sections: yes
+---
+TODO: Briefly explain the data type and data frame (columns, rows), dependent and independent variables. 
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE) #by default, all the code chunks below will be displayed when this markdown file is rendered.
+```
+
+# Initiate session
+
+First, we load packages required for this project.
+
+```{r setup1, include=TRUE, message=FALSE}
+if(!require("pacman")) install.packages("pacman", repos = "http://cloud.r-project.org")
+```
+
+```{r setup2, include=TRUE, message=FALSE}
+pacman::p_load(tidyverse, vroom, here, rprime, wrapr, data.table, ggthemes)
+```
+
+Then we import custom functions defined externally in a separate .R file.
+
+```{r import_functions}
+source(here("functions/dsst-functions.R")) #Imports custom functions
+```
+
+We imported `reduce_wm`, `msdminus`, and `msdplus` functions.
+`reduce_wm` will be used to import eprime data file, while the latter two will be used in outlier removal. Outliers are operationalised as reaction times that are [mean±2SD].
+
+# Import data
+
+Create a list of all the txt files (i.e. eprime datafiles).
+    
+```{r fileimport, echo=TRUE}
+files <- list.files(path = here("data","digitsymbol"), pattern = ".txt", full.names = T)
+```
+
+Use 'map_df' and the custom function defined above to create a mastersheet dataframe;`map_df` applies the function `reduce_wm` to all the txt files in the list 'files'.
+
+```{r mastersheet, echo=TRUE}
+mastersheet <- map_df(files, reduce_wm) %>% as_tibble(.)
+write.csv(mastersheet, here("data/dsst-mastersheet-48pp.csv")) #Save this mastersheet as csv.
+```
+
+There was one data file for each participant as an output from eprime. This file "mastersheet" now contains the data from all the participants in a single dataframe. 
+
+<!-- _Now you can work on this df 'mastersheet' with `tidyverse` for datawrangling purposes, filter columns and rows by conditions, subjects, etc. as and when required._ -->
+
+# Clean and clear df columns
+
+Check the column names:
+```{r column_name}
+colnames(mastersheet)
+```
+
+Now select only the required columns:
+```{r filter_column, echo=TRUE}
+mastersheet <- mastersheet %>% select(id = Eprime.Basename,
+                                      trialNo = Sample,
+                                      displayedList = Eprime.LevelName,
+                                      stim_correctness = Correctness,
+                                      expected_response = Correct,
+                                      participant_response = StimulDS1.RESP,
+                                      rt = StimulDS1.RT)
+```
+
+Change the class of some columns:
+```{r column_class}
+mastersheet$trialNo <- as.factor(mastersheet$trialNo)
+mastersheet$rt <- as.numeric(mastersheet$rt)
+```
+
+# Add new columns for accuracy and ppID
+
+First create a copy of mastersheet with a new column that has values 0 and 1 for incorr. and corr. responses. respectively to later calculate accuracy.
+
+```{r corr_incorr}
+dsst <- cbind.data.frame(mastersheet,
+                           corrIncorr = with(mastersheet,
+                                             ifelse(expected_response == participant_response, 1, 0)
+                                             )
+                           )
+
+# dsst48
+```
+
+Auto-generated participant ids are not human readable. So, we'll extract easy-to-process ids.
+
+```{r participant_id, echo=TRUE}
+dsst <- dsst %>% #e.g.,`Digit Symbol-0111-1` will be broken into `Digit`, Symbol` and `0111`; `1` will be discarded:
+    separate(id, c("expt.1", "expt.2", "idNumber"), extra = 'drop') %>%
+    select(-expt.1, -expt.2) #Only select `0111`
+dsst$idNumber <- str_replace_all(dsst$idNumber, "(^0)", "") #Remove leading zero. So, the id is `111`.
+dsst$idNumber <- as.integer(dsst$idNumber) 
+```
+
+# Preparation for analysis
+
+## RT distribution and visualisation
+
+Based on the output of the `boxcox` function, rt might have to be transformed to log-, square- or other scale(s).
+
+```{r distribution, echo=TRUE}
+MASS::boxcox(rt ~ idNumber, data=dsst)
+```
+
+It seems, we could log transform the data.
+Add a new column with transforming RT to log RT.
+
+```{r log_transform}
+dsst$lrt <- log10(dsst$rt)
+dsst
+```
+
+(It's not a standard practice to log transform DSST data. So, for the moment, we'll continue with raw RT.)
+
+## Outlier removal
+
+```{r outlier, echo=TRUE, results='hide'}
+upperlimit <- dsst %>% group_by(idNumber) %>% summarise(upperlimit=msdplus(rt))
+lowerlimit <- dsst %>% group_by(idNumber) %>% summarise(lowerlimit=msdminus(rt))
+
+dsst <- merge(dsst, upperlimit)
+dsst <- merge(dsst, lowerlimit)
+
+dsst_filtered <- dsst %>% filter(rt>lowerlimit & rt<upperlimit)
+```
+
+Filter out incorrect responses, and create a df for analyses.
+```{r filter_acc}
+
+dsst_filtered_inccorrect <- dsst_filtered %>% filter(corrIncorr==0) # This is the df of only incorrect responses
+dsst_filtered_correct <- dsst_filtered %>% filter(corrIncorr==1) # This is the df of only correct responses; analyses on this.
+dsst_dat <- dsst_filtered_correct #making a copy; for ease to remember and ease to work.
+```
+
+## Plots
+
+To group the plots by age-group, factorize the 'group' column
+```{r factorise_group}
+dsst.dat$group <- as.factor(dsst.dat$group)
+```
+
+**Density plot**
+
+```{r densityplot, fig.width=15}
+cowplot::plot_grid(
+ ggplot(data = dsst, aes(x=rt, color=group)) + geom_density() +
+  xlab("Reaction time [ms]") +
+  ylab("Number of responses") +
+  ggtitle("...of all responses"),
+ ggplot(data = dsst.dat, aes(x=rt, color=group)) + geom_density() +
+  xlab("Reaction time [ms]") +
+  ylab("Number of responses") +
+  ggtitle("...after filtering"))
+
+```
+
+
+**Histogram and frequency polygons**
+
+```{r, fig.width=15}
+cowplot::plot_grid(ggplot(data = dsst, aes(x=rt, fill = group)) + geom_histogram(stat = "bin", bins = 75) + geom_freqpoly(stat = "bin", bins = 75) +
+  xlab("Reaction time [ms]") +
+  ylab("Number of responses") +
+  ggtitle("...of all responses"), 
+ggplot(data = dsst, aes(x=rt, fill = group)) + geom_histogram(stat = "bin", bins = 75) + geom_freqpoly(stat = "bin", bins = 75) +
+  xlab("Reaction time [ms]") +
+  ylab("Number of responses") +
+  ggtitle("after filtering"))
+```
+
+
+# End
+
+Get the session info.
+
+```{r info, eval=FALSE}
+sessionInfo()
+```
+
+Save the data.
+
+```{r save, echo=TRUE, eval=FALSE}
+save.image("dsst-v1.RData")
+```

@@ -1,0 +1,121 @@
+---
+title: "Sentence comprehension: Summary plots"
+author: "Pratik Bhandari"
+date: "2020-07-29 (last revised: `r format(Sys.time())`)"
+editor_options: 
+  chunk_output_type: inline
+output: 
+    html_document:
+        toc: no
+---
+
+TODO: Briefly explain the data type and data frame (columns, rows), dependent and independent variables. 
+
+```{r setup1, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE) #by default, all the code chunks below will be displayed when this markdown file is rendered.
+```
+
+**Initiate session**
+
+First, we load packages required for this project.
+
+```{r setup2, include=TRUE, message=FALSE}
+source(here::here("rmd-scripts", "load-packages.R"))
+```
+
+We are continuing from the previous Rmd files (01_preprocessing.Rmd and 02_glmm.Rmd).
+
+```{r}
+load(here("rmd-scripts/02_crwdscng-v1.RData")
+```
+
+**Summary df 1**
+
+Group and summarise with accuracy in percentages.
+
+```{r df1, cache=TRUE}
+dat.anv <- dat.subj2.v %>%  #recall that `dat.subj2.v` is the df that contains trials with verb correct responses
+  group_by(participants,speed, cloze, listnumber) %>%
+    summarise(totalCorr=sum(noun_corr1==1), totalIncorr=sum(noun_corr1==0)) %>%
+      mutate(total=totalCorr+totalIncorr,
+             accuracy=round(((totalCorr/(totalCorr+totalIncorr))*100), digits=2))
+dat.anv <- droplevels(dat.anv)
+```
+
+Refactor and raname the factors for better interpretibility in the plot.
+
+```{r df2, cache=TRUE}
+dat.anv <- dat.anv %>% mutate(cloze=factor(cloze, levels = c("Low", "High"),
+                                           labels = c("Low Predictability", "High Predictability")),
+                              speed=factor(speed, levels = c("normal", "slow"),
+                                           labels = c('Normal', 'Slow')))
+```
+
+
+**Summary df 2**
+
+Create a df with mean and SE of accuracies across the conditions.
+
+```{r}
+dat.anv2 <- summarySEwithin(
+  data = dat.anv,
+  measurevar = 'accuracy',
+  withinvars = c('speed', 'cloze'),
+  idvar = 'participants'
+) %>% 
+  select(speed, cloze, N, accuracy, se) %>% 
+  mutate(cloze=factor(cloze, levels = c("Low", "High"),
+                      labels = c("Low Predictability", "High Predictability")),
+       speed=factor(speed, levels = c("normal", "slow"),
+                    labels = c('Normal', 'Slow')))
+```
+
+
+**Raincloudplot**
+
+```{r}
+ns_raincloud <-
+ggplot(dat.anv, aes(x=speed,y=accuracy, fill=speed, group=speed))+
+  geom_flat_violin(position = position_nudge(x = .3, y = 0),
+                   adjust =2, trim =TRUE)+
+  geom_point(position = position_jitter(width = .15),
+             size = .9, alpha=.4, colour = "black")+
+  geom_point(data = dat.anv2, #Create this df from `dat.anv`
+             aes(x = speed, y = accuracy),
+             position = position_nudge(.25))+
+  geom_errorbar(data = dat.anv2, 
+                aes(x = speed, y = accuracy,
+                    ymin = accuracy-se, ymax = accuracy+se),
+                position = position_nudge(.25), width = 0.1, size = 0.8)+
+  geom_line(data = dat.summary_expt1,
+            aes(x = speed, y = accuracy, group = cloze),
+            position = position_nudge(.25),
+            linetype = 1, size = 0.8)+
+  theme_cowplot()+
+  guides(fill = FALSE, colour = FALSE) +
+  scale_fill_manual(#name="Target word\npredictability",
+                    values = c("Normal"="#DCDCDC", "Slow" ="#808080")) +
+  labs(#title = "Experiment 1: Slow vs Normal",
+       x = "Speech rate", y = "Response accuracy",
+       colour=" ")+
+  facet_grid(~cloze) +
+  theme(axis.text.x = element_text(size = 13),
+        axis.text.y = element_text(size = 13),
+        axis.title = element_text(size = 15),
+        strip.text.x = element_text(size = 15))
+```
+
+# End
+
+Get the session info.
+
+```{r info, eval=FALSE}
+sessionInfo()
+```
+
+Save the data.
+
+```{r save, echo=TRUE, eval=FALSE}
+save.image("03_crwdscng-v1.RData")
+```
+

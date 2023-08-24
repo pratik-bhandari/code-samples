@@ -1,0 +1,128 @@
+---
+title: "Sentence comprehension: Analyses"
+author: "Pratik Bhandari"
+date: "2020-07-20 (last revised: `r format(Sys.time())`)"
+editor_options: 
+  chunk_output_type: inline
+output: 
+    html_document:
+        toc: yes
+        toc_depth: 2
+        number_sections: yes
+---
+
+TODO: Briefly explain the data type and data frame (columns, rows), dependent and independent variables. 
+
+```{r setup1, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE) #by default, all the code chunks below will be displayed when this markdown file is rendered.
+```
+
+# Initiate session
+
+First, we load packages required for this project.
+
+```{r setup2, include=TRUE, message=FALSE}
+source(here::here("rmd-scripts", "load-packages.R"))
+```
+
+# Prepare df
+
+We are continuing from the previous Rmd file (01_preprocessing.Rmd).
+
+```{r}
+load(here("rmd-scripts/01_crwdscng-v1.RData")
+```
+
+**Create a new df for GLMM.**
+
+
+```{r}
+
+# Setting df
+dat.LM <- dat.LM[which(dat.LM$verb_acc=="1" & dat.LM$noiseband!='4'),] # This selects only verb-correct responses at 4-channel noise-vocoded speech
+dat.LM <- droplevels(dat.LM) #We could directly have done `dat.LM <- dat.subj2.v` as well.
+
+# Converting to factors with appropriate levels
+dat.LM$cloze <- factor(dat.LM$cloze, levels = c("Low", "High"), labels = c("Low", "High"))
+dat.LM$speed <- factor(dat.LM$speed, levels = c('normal', 'slow'), labels = c('Normal', 'Slow'))
+
+# Setting appropriate contrasts
+contrasts(dat.LM$cloze) <- contr.treatment(3) 
+contrasts(dat.LM$speed) <- contr.treatment(3) 
+
+```
+
+## Create model matrix
+```{r modelmatrix, cache=TRUE, eval=FALSE}
+mm <- model.matrix(~ speed*cloze, data = dat.LM)
+
+slow <- mm[,2];
+hp <- mm[,3];
+slow_hp <- mm[,4]
+```
+
+# Maximal model with zero cp
+```{r zcp, eval=FALSE, cache=TRUE}
+tic("model runtime");
+zcp <- glmer(noun_acc.v ~ 1 + slow + hp + slow_hp +
+        (1 + slow + hp + slow_hp || participants) + 
+        (1 + slow + hp + slow_hp || itemNo), 
+      data=dat.LM, family = "binomial", 
+      control = glmerControl(calc.derivs = FALSE, optimizer="bobyqa", optCtrl = list(maxfun=1e6)),
+      nAGQ = 0, na.action = na.exclude);
+toc()
+```
+model runtime: `56.231` sec elapsed
+
+This maximal model converges well.
+
+**Predictability as continuous variable**
+
+Run the same maximal model as in `zcp` model. Here, instead of using categorical variable `cloze`, use `cloze_prob`.
+
+```{r cloze-probability, cache=TRUE}
+tic("model runtime");
+zcp_cloze <- glmer(noun_acc.v ~ 1 + cloze_prob*speed +
+                  (1 + cloze_prob*speed || participants) + 
+                  (1 + cloze_prob*speed || itemNo), 
+                data=dat.LM, family = "binomial", 
+                control = glmerControl(calc.derivs = FALSE, optimizer="bobyqa", optCtrl = list(maxfun=1e6)),
+                nAGQ = 0, na.action = na.exclude);
+toc()
+```
+model runtime: `1400.87` sec elapsed
+
+The results are not different than using cloze as categorical variable.
+
+# Check for adaptation
+
+Participants may show listening effect, i.e. adaptation. Add trial number to the fixed effects structure to test this.
+
+```{r adaptation-model}
+tic("model runtime")
+zcp_tn <- glmer(noun_acc.v ~ 1 + slow + hp + slow_hp + c_trialNo +
+               (1 + slow + hp + slow_hp || participants) + 
+               (1 + slow + hp + slow_hp || itemNo), 
+             data=dat.LM, family = "binomial", 
+             control = glmerControl(calc.derivs = FALSE, optimizer="bobyqa", optCtrl = list(maxfun=1e6)),
+             nAGQ = 0, na.action = na.exclude)
+toc()
+```
+model runtime: `46.112` sec elapsed
+
+
+# End
+
+Get the session info.
+
+```{r info, eval=FALSE}
+sessionInfo()
+```
+
+Save the data.
+
+```{r save, echo=TRUE, eval=FALSE}
+save.image("02_crwdscng-v1.RData")
+```
+
+
